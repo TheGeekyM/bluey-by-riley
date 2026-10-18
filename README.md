@@ -39,11 +39,45 @@ Needs full Xcode. Open `GooglyEyes.xcodeproj` (regenerate with `xcodegen generat
 
 On the phone: double tap him to wake him up or put him back to sleep, and press and hold to ask him something. The faint speaker button at the top right sets the chirp volume and picks which Mac to pair with.
 
+## Android app
+
+A port of the iPhone app (Kotlin + Compose) in `android/`. It pairs with the Linux host below (Claude); it doesn't use the Mac app's OpenAI voice.
+
+```
+cd android
+echo "sdk.dir=$ANDROID_HOME" > local.properties   # once
+./gradlew assembleDebug        # or assembleRelease, signed with android/keystore.properties if present
+adb install app/build/outputs/apk/debug/app-debug.apk
+```
+
+Needs JDK 17+ and the Android SDK (platform 36). Same gestures as the iPhone: double tap to wake/sleep, press and hold to ask.
+
+## Linux host with Claude (instead of the Mac app)
+
+`linux/bluey_host.py` does the Mac app's job on a Linux desktop (X11: GNOME on Xorg, KDE, …), with **Claude** as his brain instead of OpenAI. The Android app finds it on the Wi-Fi and sends it what you say as text (the phone's own speech recognition). Claude answers, looks at the screen (screenshot + tesseract), points with his own cursor, and clicks, types, scrolls and opens apps (xdotool). His reply pops up as a speech bubble on the computer. Meeting notes (the live transcript) go to `~/Documents/Bluey Notes/`.
+
+```
+sudo apt install python3-gi gir1.2-gtk-3.0 xdotool tesseract-ocr imagemagick xclip avahi-daemon   # usually already there
+linux/setup.sh                                                   # private venv with the Claude SDK
+mkdir -p ~/.config/bluey && echo 'sk-ant-...' > ~/.config/bluey/anthropic_key && chmod 600 ~/.config/bluey/anthropic_key
+~/.local/share/bluey/venv/bin/python linux/bluey_host.py         # --no-control: look and point only; --lang eng+ara; --effort medium
+```
+
+Run it as your desktop user, not root. The key never leaves the computer. To stop him mid-action: move your mouse to the top-left corner, or `pkill -USR1 -f bluey_host.py`. `linux/fake_phone.py PORT` checks the host without a phone.
+
+To start it at login, a systemd user service works well (`~/.config/systemd/user/bluey.service` with `ExecStart=%h/.local/share/bluey/venv/bin/python /path/to/linux/bluey_host.py` and `WantedBy=graphical-session.target`).
+
+Phones: the Android app needs a speech recognizer it can use. On Xiaomi/HyperOS phones without Google's, give the built-in one the microphone: `adb shell pm grant com.xiaomi.mibrain.speech android.permission.RECORD_AUDIO`.
+
+Not ported from the Mac: the clickable-controls list (he clicks words and spots instead), the global wake hotkey, the fancier cursor animations, and the speaker-labelled audio transcripts. The iPhone app and Mac app are unchanged and still use OpenAI. Wayland sessions aren't supported (pick "GNOME on Xorg" at login).
+
 ## Layout
 
 - `Shared/` pairing protocol (Bonjour `_googly._tcp`, newline JSON) and colors, used by both apps
 - `Mac/` menu bar app (Swift package target `GooglyMac`)
 - `iOS/` iPhone app (SwiftUI)
+- `android/` Android app (Kotlin, Jetpack Compose)
+- `linux/` Linux host with Claude, stands in for the Mac app (Python, GTK)
 
 ## License
 
