@@ -8,11 +8,6 @@
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 
     <!-- Lets the app see the phone's speech recognizers (hidden from apps by default since Android 11). -->
-    <queries>
-        <intent>
-            <action android:name="android.speech.RecognitionService" />
-        </intent>
-    </queries>
 
     <application
         android:label="Bluey"

@@ -54,7 +54,7 @@ Needs JDK 17+ and the Android SDK (platform 36). Same gestures as the iPhone: do
 
 ## Linux host with Claude (instead of the Mac app)
 
-`linux/bluey_host.py` does the Mac app's job on a Linux desktop (X11: GNOME on Xorg, KDE, …), with **Claude** as his brain instead of OpenAI. The Android app finds it on the Wi-Fi and sends it what you say as text (the phone's own speech recognition). Claude answers, looks at the screen (screenshot + tesseract), points with his own cursor, and clicks, types, scrolls and opens apps (xdotool). His reply pops up as a speech bubble on the computer. Meeting notes (the live transcript) go to `~/Documents/Bluey Notes/`.
+`linux/bluey_host.py` does the Mac app's job on a Linux desktop (X11: GNOME on Xorg, KDE, …), with **Claude** as his brain instead of OpenAI. The Android app finds it on the Wi-Fi and records what you say while you hold the screen and sends it over; the computer turns it into text with Whisper (faster-whisper, on the CPU, offline). Claude answers, looks at the screen (screenshot + tesseract), points with his own cursor, and clicks, types, scrolls and opens apps (xdotool). His reply pops up as a speech bubble on the computer. Meeting notes (the live transcript) go to `~/Documents/Bluey Notes/`.
 
 ```
 sudo apt install python3-gi gir1.2-gtk-3.0 xdotool tesseract-ocr imagemagick xclip avahi-daemon   # usually already there
@@ -67,7 +67,7 @@ Run it as your desktop user, not root. The key never leaves the computer. To sto
 
 To start it at login, a systemd user service works well (`~/.config/systemd/user/bluey.service` with `ExecStart=%h/.local/share/bluey/venv/bin/python /path/to/linux/bluey_host.py` and `WantedBy=graphical-session.target`).
 
-Phones: the Android app needs a speech recognizer it can use. On Xiaomi/HyperOS phones without Google's, give the built-in one the microphone: `adb shell pm grant com.xiaomi.mibrain.speech android.permission.RECORD_AUDIO`.
+Speech: hold the screen while you talk. Whisper's `small` model downloads on first setup; pick another with `BLUEY_WHISPER=base` (faster) or `medium` (more accurate) in the service environment.
 
 Not ported from the Mac: the clickable-controls list (he clicks words and spots instead), the global wake hotkey, the fancier cursor animations, and the speaker-labelled audio transcripts. The iPhone app and Mac app are unchanged and still use OpenAI. Wayland sessions aren't supported (pick "GNOME on Xorg" at login).
 

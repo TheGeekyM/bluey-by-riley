@@ -1,23 +1,20 @@
 package com.bluey.app
 
-import android.content.ComponentName
+import android.annotation.SuppressLint
 import android.content.Context
-import android.content.Intent
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioRecord
 import android.media.AudioTrack
-import android.os.Bundle
+import android.media.MediaRecorder
 import android.os.Handler
 import android.os.Looper
-import android.speech.RecognitionListener
-import android.speech.RecognitionService
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
+import android.util.Base64
 import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import java.util.UUID
+import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
 import kotlin.math.PI
 import kotlin.math.exp
@@ -26,9 +23,10 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.random.Random
 
-/** A listening session. Once he's awake the phone's speech recognition runs the whole time: everything you say goes
- *  to the computer as background context, and what you say while holding the screen is the question. Claude runs on
- *  the computer and answers in a speech bubble there, with a little cartoon chirp here. Main thread only. */
+/** A listening session. What you say while holding the screen is recorded and sent to the computer, which
+ *  transcribes it (Whisper) and has Claude answer in a speech bubble there, with a little cartoon chirp here.
+ *  ponytail: no background listening; phone recognizers (Xiaomi's, Google's on MIUI) proved unreliable. Stream
+ *  audio to the computer continuously if background context is wanted back. Main thread only. */
 class LiveVoice(private val context: Context) {
     enum class State { asleep, waking, listening, asking, thinking, speaking }
 
@@ -37,16 +35,13 @@ class LiveVoice(private val context: Context) {
     /** Asks the user for the mic. Calls back with whether it was granted. */
     var requestMic: ((((Boolean) -> Unit)) -> Unit)? = null
     var isConnected: () -> Boolean = { false }
-    /** Something said in the background, for context. */
-    var heard: ((String) -> Unit)? = null
-    /** Sends a question to the computer; calls back with his answer (null if the computer went away). */
-    var ask: ((String, (String?) -> Unit) -> Unit)? = null
+    /** Sends a question (text, or base64 16 kHz mono 16-bit PCM) to the computer; calls back with his answer
+     *  (null if the computer went away). */
+    var ask: ((String?, String?, (String?) -> Unit) -> Unit)? = null
     var onNotice: ((String) -> Unit)? = null
     var onStateChange: ((State) -> Unit)? = null
     var onSessionStart: (() -> Unit)? = null
     var onSessionEnd: (() -> Unit)? = null
-    var onUserTurn: ((String, Boolean) -> Unit)? = null
-    var onUserWords: ((String, String, Boolean) -> Unit)? = null
     var onReply: ((String) -> Unit)? = null
 
     /** Loudness of his chirp right now, 0…1. */
@@ -61,19 +56,14 @@ class LiveVoice(private val context: Context) {
         }
 
     private val main = Handler(Looper.getMainLooper())
-    private var recognizer: SpeechRecognizer? = null
+    @Volatile private var recording: ByteArrayOutputStream? = null
     private var track: AudioTrack? = null
     private val chirper = Executors.newSingleThreadExecutor()
     private var pendingBuffers = 0
 
     private var holding = false
-    /** Let go of the screen: waiting for the recognizer's last words before asking. */
-    private var askPending = false
-    private var question = ""
-    private var partial = ""
     private var waitingForAnswer = false
     private var sleepAfterReply = false
-    private val finishAskLater = Runnable { finishAsk() }
 
     private fun moveTo(new: State) {
         if (new == state) return
@@ -91,10 +81,6 @@ class LiveVoice(private val context: Context) {
             onNotice?.invoke("Connect to your computer to talk to him.")
             return
         }
-        if (!SpeechRecognizer.isRecognitionAvailable(context)) {
-            onNotice?.invoke("This phone has no speech recognition. Install the Google app.")
-            return
-        }
         moveTo(State.waking)
         val askMic = requestMic ?: { done -> done(true) }
         askMic { granted ->
@@ -107,7 +93,7 @@ class LiveVoice(private val context: Context) {
             startChirps()
             onSessionStart?.invoke()
             chirp(2)
-            startRecognizer()
+            if (holding) startRecording()
             moveTo(if (holding) State.asking else State.listening)
         }
     }
@@ -115,65 +101,77 @@ class LiveVoice(private val context: Context) {
     fun sleep() {
         Log.i(TAG, "sleep (was $state)")
         val wasRunning = state != State.asleep
-        main.removeCallbacks(finishAskLater)
-        recognizer?.destroy()
-        recognizer = null
+        recording = null
         val t = track
         track = null
         chirper.execute { t?.runCatching { stop(); release() } }
         if (wasRunning) onSessionEnd?.invoke()
-        holding = false; askPending = false; waitingForAnswer = false; sleepAfterReply = false
-        question = ""; partial = ""; pendingBuffers = 0; level = 0.0
+        holding = false; waitingForAnswer = false; sleepAfterReply = false
+        pendingBuffers = 0; level = 0.0
         moveTo(State.asleep)
     }
 
     /** Says a quick hi (for checking the chirp volume). */
     fun sayHi() {
         if (state == State.asleep) { wake(); return }
-        send("Say a quick, cheerful hi in under eight words.")
+        send("Say a quick, cheerful hi in under eight words.", null)
     }
 
     // Hold to ask
 
-    /** You pressed and held the screen: what you say now is the question. */
+    /** You pressed and held the screen: what you say now is recorded as the question. */
     fun beginAsk() {
         holding = true
-        question = ""
         if (state == State.asleep) { wake(); return }
+        if (state == State.waking) return
+        startRecording()
         if (state == State.listening || state == State.speaking) moveTo(State.asking)
     }
 
-    /** You let go: once the recognizer hands over your last words, he answers. */
+    /** You let go: the recording goes to the computer, and he answers. */
     fun endAsk() {
         if (!holding) return
         holding = false
-        if (state == State.asleep || state == State.waking) return
-        askPending = true
-        recognizer?.stopListening()  // → onResults / onError → finishAsk
-        main.postDelayed(finishAskLater, 3000)  // some recognizers never call back
-    }
-
-    private fun finishAsk() {
-        if (!askPending) return
-        if (partial.isNotBlank()) deliver(partial)  // words it heard but never finalized
-        askPending = false
-        main.removeCallbacks(finishAskLater)
-        val q = question.trim()
-        question = ""
-        listen()
-        if (q.isEmpty()) {
-            onNotice?.invoke("I didn't catch that.")
+        val audio = recording?.toByteArray()
+        recording = null
+        if (state == State.asleep || state == State.waking || audio == null) return
+        if (audio.size < REC_RATE * 2 / 3) {  // under a third of a second: a tap, not a question
+            onNotice?.invoke("Hold the screen while you talk.")
             moveTo(State.listening)
             return
         }
-        send(q)
+        send(null, Base64.encodeToString(audio, Base64.NO_WRAP))
     }
 
-    private fun send(q: String) {
+    @SuppressLint("MissingPermission")  // only called once the mic is granted
+    private fun startRecording() {
+        if (recording != null) return
+        val out = ByteArrayOutputStream()
+        recording = out
+        Thread {
+            val size = maxOf(AudioRecord.getMinBufferSize(REC_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT), 4096)
+            val rec = runCatching {
+                AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, REC_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, size)
+            }.getOrNull()
+            if (rec == null || rec.state != AudioRecord.STATE_INITIALIZED) {
+                main.post { onNotice?.invoke("I can't use the microphone right now.") }
+                return@Thread
+            }
+            val buf = ByteArray(size)
+            rec.startRecording()
+            while (recording === out && out.size() < REC_RATE * 2 * 60) {  // a minute at most
+                val n = rec.read(buf, 0, buf.size)
+                if (n > 0) out.write(buf, 0, n)  // ByteArrayOutputStream is synchronized
+            }
+            rec.stop(); rec.release()
+        }.start()
+    }
+
+    private fun send(text: String?, audio: String?) {
         val ask = ask ?: return
         moveTo(State.thinking)
         waitingForAnswer = true
-        ask(q) { answer ->
+        ask(text, audio) { answer ->
             if (state == State.asleep) return@ask
             waitingForAnswer = false
             if (answer == null) onNotice?.invoke("The computer didn't answer.")
@@ -200,76 +198,6 @@ class LiveVoice(private val context: Context) {
         if (pendingBuffers != 0 || waitingForAnswer) return
         if (sleepAfterReply) { sleep(); return }
         if (state == State.speaking || state == State.thinking) moveTo(if (holding) State.asking else State.listening)
-    }
-
-    // Speech recognition: one utterance at a time, restarted after each, so it's always listening.
-
-    private fun startRecognizer() {
-        // Prefer Google's recognizer: some phones default to one that only does Chinese well.
-        val google = context.packageManager.queryIntentServices(Intent(RecognitionService.SERVICE_INTERFACE), 0)
-            .firstOrNull { it.serviceInfo.packageName == "com.google.android.googlequicksearchbox" }?.serviceInfo
-        val r = if (google != null) SpeechRecognizer.createSpeechRecognizer(context, ComponentName(google.packageName, google.name))
-        else SpeechRecognizer.createSpeechRecognizer(context)
-        r.setRecognitionListener(object : RecognitionListener {
-            override fun onReadyForSpeech(params: Bundle?) {}
-            override fun onBeginningOfSpeech() {}
-            override fun onRmsChanged(rmsdB: Float) {}
-            override fun onBufferReceived(buffer: ByteArray?) {}
-            override fun onEndOfSpeech() {}
-            override fun onEvent(eventType: Int, params: Bundle?) {}
-            override fun onPartialResults(results: Bundle?) {
-                best(results)?.let { partial = it }
-            }
-            override fun onResults(results: Bundle?) {
-                Log.i(TAG, "heard: ${best(results)}")
-                if (recognizer !== r) return
-                partial = ""
-                best(results)?.let(::deliver)
-                if (askPending) finishAsk() else listen()
-            }
-            override fun onError(error: Int) {
-                Log.i(TAG, "recognizer error $error")
-                if (recognizer !== r) return
-                if (askPending) { finishAsk(); return }
-                if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
-                    onNotice?.invoke("I need the microphone. Turn it on for Bluey in Android's Settings.")
-                    sleep()
-                    return
-                }
-                // Silence, a timeout or a busy recognizer: just start again in a moment.
-                main.postDelayed({ if (recognizer === r) listen() }, if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) 800 else 250)
-            }
-        })
-        Log.i(TAG, "recognizer: ${google?.packageName ?: "system default"}")
-        recognizer = r
-        listen()
-    }
-
-    private fun best(results: Bundle?) =
-        results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()?.takeIf { it.isNotBlank() }
-
-    private fun listen() {
-        val r = recognizer ?: return
-        partial = ""
-        r.cancel()
-        r.startListening(Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
-            // The phone's language; some recognizers (Xiaomi's) otherwise assume Chinese.
-            val language = java.util.Locale.getDefault().toLanguageTag()
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, language)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, language)
-        })
-    }
-
-    /** Words the recognizer finished: part of the question while you hold, background context otherwise. */
-    private fun deliver(text: String) {
-        val asked = holding || askPending
-        val id = UUID.randomUUID().toString()
-        onUserTurn?.invoke(id, asked)
-        onUserWords?.invoke(id, text, asked)
-        if (asked) question += " $text" else heard?.invoke(text)
     }
 
     // Chirps
@@ -337,5 +265,6 @@ class LiveVoice(private val context: Context) {
     companion object {
         const val RATE = 24_000
         private const val TAG = "Bluey"
+        private const val REC_RATE = 16_000
     }
 }

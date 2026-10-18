@@ -68,6 +68,22 @@ def claude():
     return anthropic.Anthropic(api_key=key) if key else anthropic.Anthropic()
 
 
+_whisper, _whisper_lock = None, threading.Lock()
+
+
+def transcribe(pcm_b64):
+    """The phone's recording (base64 16 kHz mono 16-bit PCM) as text, by Whisper running here on the CPU."""
+    global _whisper
+    import numpy as np
+    from faster_whisper import WhisperModel
+    with _whisper_lock:  # ponytail: one at a time; the model loads on first use (~2 s)
+        if _whisper is None:
+            _whisper = WhisperModel(os.environ.get("BLUEY_WHISPER", "small"), device="cpu", compute_type="int8")
+        audio = np.frombuffer(base64.b64decode(pcm_b64), dtype=np.int16).astype(np.float32) / 32768
+        segments, _ = _whisper.transcribe(audio, beam_size=1, vad_filter=True)
+        return " ".join(seg.text.strip() for seg in segments).strip()
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # Instructions and tools (copied from the Mac's RealtimeHost.swift; only platform words changed)
 
@@ -809,7 +825,18 @@ class Host:
             if text:
                 self.overheard.append(text)
         elif cmd == "ask":
-            self.jobs.put(lambda: self.answer((p.get("text") or "").strip(), phone, reply))
+            def ask():
+                question = (p.get("text") or "").strip()
+                if not question and p.get("audio"):
+                    try:
+                        question = transcribe(p["audio"])
+                    except Exception as e:
+                        print(f"transcribe failed: {e}", file=sys.stderr, flush=True)
+                    print(f"asked: {question!r}", flush=True)
+                    if question:
+                        phone.send({"command": "asked", "text": question})
+                self.answer(question, phone, reply)
+            self.jobs.put(ask)
         elif cmd == "notes":
             background("notes", lambda: (str(write_notes(json.loads(p.get("text") or "{}"))),))
         elif cmd == "tool":

@@ -6,6 +6,7 @@
 Every reply must carry a command and the request's callID, face packets must keep coming (at least once a
 second), and look_at_screen must return text and a screenshot, and every question gets an answer.
 """
+import base64
 import json
 import socket
 import sys
@@ -29,6 +30,8 @@ def main(port):
             if "face" in reply:
                 faces += 1
                 continue
+            if "callID" not in reply and reply.get("command") in ("replying", "asked", "report", "sleep"):
+                continue  # notices the host pushes along the way
             assert reply.get("callID") == call, f"reply for another call: {reply}"
             assert reply.get("command") == expect, f"expected {expect}: {str(reply)[:200]}"
             return reply, faces
@@ -63,6 +66,29 @@ def main(port):
     reply, _ = request({"command": "notes", "text": json.dumps(session)}, "notes")
     assert reply.get("text", "").endswith("fake0000-test"[:8]), reply
     print("notes written to", reply["text"])
+
+    # A spoken question is transcribed here; one second of silence transcribes to nothing.
+    silence = base64.b64encode(bytes(32000)).decode()
+    reply, _ = request({"command": "ask", "audio": silence}, "answer")
+    assert reply.get("text") == "I didn't catch that.", reply
+    print("audio ask (silence):", reply["text"])
+
+    # Real speech (espeak-ng, if installed) comes back as words.
+    try:
+        import subprocess
+        wav = subprocess.run(["espeak-ng", "-s", "150", "--stdout", "what time is it"], capture_output=True, check=True).stdout
+        pcm = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", "-", "-f", "s16le", "-ac", "1", "-ar", "16000", "-"],
+                             input=wav, capture_output=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        pcm = None
+    if pcm:
+        send({"command": "ask", "audio": base64.b64encode(pcm).decode(), "callID": "speech"})
+        while (packet := json.loads(reader.readline())).get("command") != "asked":
+            pass
+        assert packet.get("text"), packet  # espeak is robotic; Whisper often mishears it, so any words will do
+        print("audio ask (speech) heard:", packet["text"])
+        while json.loads(reader.readline()).get("callID") != "speech":
+            pass
 
     # A question must always get an answer, even when Claude can't be reached (then it says why).
     send({"command": "heard", "text": "we're looking at the sales numbers"})

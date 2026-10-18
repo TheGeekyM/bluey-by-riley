@@ -79,14 +79,11 @@ class MainActivity : ComponentActivity() {
             else { micDone = done; micPermission.launch(Manifest.permission.RECORD_AUDIO) }
         }
         live.isConnected = { link.connected }
-        live.heard = { link.send(Packet(command = "heard", text = it)) }
-        live.ask = { question, done -> link.request(Packet(command = "ask", text = question)) { done(it?.text) } }
+        live.ask = { question, audio, done -> link.request(Packet(command = "ask", text = question, audio = audio)) { done(it?.text) } }
         live.onNotice = { Toast.makeText(this, it, Toast.LENGTH_SHORT).show() }
         live.onSessionStart = { store.start() }
         store.onSync = { notes.send(it) }
         live.onSessionEnd = { store.end() }
-        live.onUserTurn = { item, asked -> store.placeholder(item, asked) }
-        live.onUserWords = { item, text, asked -> store.heard(item, text, asked) }
         live.onReply = { store.reply(it) }
         live.onStateChange = { state ->
             when (state) {
@@ -103,6 +100,7 @@ class MainActivity : ComponentActivity() {
                 "wake" -> live.wake()
                 "sleep" -> live.sleepAfterReply()
                 "replying" -> live.replying()
+                "asked" -> packet.text?.let { store.heard(java.util.UUID.randomUUID().toString(), it, asked = true) }
                 "report" -> packet.text?.let { store.report(it) }
             }
         }
